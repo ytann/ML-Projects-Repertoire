@@ -1,0 +1,221 @@
+from pulp import *
+
+def formulate_ad_campaign_optimization(campaign_data, total_budget, objective_type="conversion"):
+    """
+    Formulates the digital ad campaign budget allocation problem using PuLP.
+
+    This function sets up the optimization problem to maximize either total net conversion count
+    or total projected revenue, subject to a fixed total budget and campaign-specific constraints.
+    It linearizes the 'min' function for calculating reached unique users using binary variables
+    and the Big M method, transforming the problem into a Mixed-Integer Linear Program (MILP).
+
+    Args:
+        campaign_data (dict): A dictionary where keys are campaign names (str)
+                              and values are dictionaries containing campaign attributes.
+                              Required attributes for each campaign:
+                                  - 'Reach Opportunity (n count)': int (max unique users reachable)
+                                  - 'Optimal Frequency': int (ideal ad exposures per user)
+                                  - 'CPM (dollar)': float (Cost Per Mille/Thousand Impressions)
+                                  - 'Net Conversion (%)': float (conversion rate of reached users, e.g., 0.02 for 2%)
+                                  - 'Revenue per person': float (revenue generated per conversion)
+                              Optional attributes:
+                                  - 'Impression opportunity': int (hard upper limit on total impressions)
+                                  - 'Min Spend': float (minimum budget to allocate to this campaign)
+                                  - 'Max Spend': float (maximum budget to allocate to this campaign)
+                              Example structure:
+                              {
+                                  'Campaign_A': {'Reach Opportunity (n count)': 800000, 'Optimal Frequency': 3,
+                                                 'CPM (dollar)': 5, 'Net Conversion (%)': 0.02, 'Revenue per person': 10,
+                                                 'Min Spend': 1000},
+                                  'Campaign_B': {'Reach Opportunity (n count)': 400000, 'Optimal Frequency': 2,
+                                                 'CPM (dollar)': 7, 'Net Conversion (%)': 0.03, 'Revenue per person': 12,
+                                                 'Max Spend': 20000}
+                              }
+        total_budget (float): The total fixed budget available for all campaigns.
+        objective_type (str): Specifies the optimization goal.
+                              - 'conversion': Maximize total net conversion count.
+                              - 'revenue': Maximize total projected revenue.
+
+    Returns:
+        LpProblem: The formulated PuLP optimization problem object.
+        dict: A dictionary of PuLP variables for allocated budgets, allowing access to their optimized values.
+    """
+
+    # Create the LP problem object. We want to maximize the objective.
+    prob = LpProblem("Digital_Ad_Campaign_Optimization", LpMaximize)
+
+    # --- Step 1: Define Decision Variables ---
+    campaign_names = list(campaign_data.keys())
+
+    # x_i: Allocated budget for each campaign i (continuous, non-negative)
+    x = LpVariable.dicts("allocated_budget", campaign_names, lowBound=0, cat='Continuous')
+
+    # Auxiliary variables for linearization of ReachedUniqueUsers_i = min(ROC_i, Impressions_i(x_i) / OF_i)
+    # R_i: Actual unique users reached for campaign i (continuous, non-negative)
+    R = LpVariable.dicts("reached_unique_users", campaign_names, lowBound=0, cat='Continuous')
+
+    # y_i: Binary variable for each campaign to linearize the min function.
+    # y_i = 0 if ROC_i is the minimum, y_i = 1 if (Impressions_i(x_i) / OF_i) is the minimum.
+    y = LpVariable.dicts("binary_selector", campaign_names, cat='Binary')
+
+    # Define a large 'M' for the Big M method.
+    # M must be sufficiently large, greater than any possible value of ROC_i or (Impressions_i(x_i) / OF_i).
+    # We estimate M based on the maximum possible reach opportunity or the maximum reach achievable with the total budget.
+    max_roc_overall = max(d for d in campaign_data.values())
+    min_optimal_frequency_overall = min(d['Optimal Frequency'] for d in campaign_data.values())
+    min_cpm_overall = min(d['CPM (dollar)'] for d in campaign_data.values())
+    
+    # Max possible reach from total budget: (total_budget / min_cpm_overall * 1000) / min_optimal_frequency_overall
+    # M should be larger than the maximum of these two potential upper bounds for reach.
+    M = max(max_roc_overall, (total_budget / min_cpm_overall * 1000) / min_optimal_frequency_overall) * 1.1 # Adding a 10% buffer for safety
+
+    # PNC_i: Projected Net Conversion Count for each campaign i (continuous, non-negative)
+    PNC = LpVariable.dicts("projected_net_conversion_count", campaign_names, lowBound=0, cat='Continuous')
+    # PR_i: Projected Revenue for each campaign i (continuous, non-negative)
+    PR = LpVariable.dicts("projected_revenue", campaign_names, lowBound=0, cat='Continuous')
+
+    # --- Step 2: Define Objective Function ---
+    total_objective = LpAffineExpression()
+
+    for i in campaign_names:
+        # Calculate Impressions from allocated budget for campaign i
+        # Impressions_i(x_i) = (x_i / CPM_i) * 1000
+        impressions_from_budget = (x[i] / campaign_data[i]['CPM (dollar)']) * 1000
+
+        # Linearization of ReachedUniqueUsers_i = min(ROC_i, Impressions_i(x_i) / OF_i)
+        # This set of constraints ensures R[i] correctly takes the minimum of the two values.
+        # R[i] <= ROC_i
+        prob += R[i] <= campaign_data[i], f"R_le_ROC_{i}"
+        # R[i] <= Impressions_i(x_i) / OF_i
+        prob += R[i] <= impressions_from_budget / campaign_data[i]['Optimal Frequency'], f"R_le_Impressions_OF_{i}"
+        # R[i] >= ROC_i - M * y_i
+        prob += R[i] >= campaign_data[i] - M * y[i], f"R_ge_ROC_My_{i}"
+        # R[i] >= (Impressions_i(x_i) / OF_i) - M * (1 - y[i])
+        prob += R[i] >= (impressions_from_budget / campaign_data[i]['Optimal Frequency']) - M * (1 - y[i]), f"R_ge_Impressions_OF_M1my_{i}"
+
+        # Calculate Projected Net Conversion Count for campaign i
+        # PNC_i(x_i) = ReachedUniqueUsers_i(x_i) * Net Conversion (%)
+        prob += PNC[i] == R[i] * campaign_data[i]['Net Conversion (%)'], f"PNC_calc_{i}"
+
+        # Calculate Projected Revenue for campaign i
+        # PR_i(x_i) = ProjectedNetConversionCount_i(x_i) * Revenue per person
+        prob += PR[i] == PNC[i] * campaign_data[i], f"PR_calc_{i}"
+
+        # Add the appropriate metric to the total objective function
+        if objective_type == "conversion":
+            total_objective += PNC[i]
+        elif objective_type == "revenue":
+            total_objective += PR[i]
+        else:
+            raise ValueError("objective_type must be 'conversion' or 'revenue'")
+
+    # Set the overall objective for the problem
+    prob += total_objective, "Total_Objective"
+
+    # --- Step 3: Establish Constraints ---
+    # Total Budget Constraint: Sum of allocated budgets must not exceed the total budget.
+    prob += lpSum(x[i] for i in campaign_names) <= total_budget, "Total_Budget_Constraint"
+
+    # Optional: Maximum Impression Opportunity Constraint (if 'Impression opportunity' is a hard limit)
+    # This constraint ensures that the impressions generated do not exceed the available opportunity.
+    for i in campaign_names:
+        if 'Impression opportunity' in campaign_data[i]:
+            impressions_from_budget = (x[i] / campaign_data[i]['CPM (dollar)']) * 1000
+            prob += impressions_from_budget <= campaign_data[i]['Impression opportunity'], f"Max_Impression_Opportunity_{i}"
+
+    # Optional: Minimum/Maximum Allocations per Campaign
+    # These constraints allow setting strategic bounds on individual campaign spending.
+    for i in campaign_names:
+        if 'Min Spend' in campaign_data[i]:
+            prob += x[i] >= campaign_data[i], f"Min_Spend_{i}"
+        if 'Max Spend' in campaign_data[i]:
+            prob += x[i] <= campaign_data[i], f"Max_Spend_{i}"
+
+    return prob, x
+
+# --- Example Usage (Demonstrates how to use the function and interpret results) ---
+if __name__ == "__main__":
+    # Sample Data for Digital Ad Campaigns
+    # This dictionary holds all the necessary attributes for each campaign.
+    campaign_attributes = {
+        'Campaign_A': {
+            'Potential Universe': 1000000,
+            'Reach Opportunity (n count)': 800000, # Max unique users reachable by this campaign
+            'Optimal Frequency': 3, # Ideal number of times an ad is shown to a user
+            'CPM (dollar)': 5, # Cost per 1000 impressions
+            'Net Conversion (%)': 0.02, # 2% conversion rate of reached users
+            'Revenue per person': 10, # $10 revenue per converted person
+            'Min Spend': 1000 # Optional: Minimum budget to allocate to Campaign A
+        },
+        'Campaign_B': {
+            'Potential Universe': 500000,
+            'Reach Opportunity (n count)': 400000,
+            'Optimal Frequency': 2,
+            'CPM (dollar)': 7,
+            'Net Conversion (%)': 0.03,
+            'Revenue per person': 12,
+            'Max Spend': 20000 # Optional: Maximum budget to allocate to Campaign B
+        },
+        'Campaign_C': {
+            'Potential Universe': 2000000,
+            'Reach Opportunity (n count)': 1500000,
+            'Optimal Frequency': 4,
+            'CPM (dollar)': 4,
+            'Net Conversion (%)': 0.015,
+            'Revenue per person': 15
+        }
+    }
+
+    total_campaign_budget = 50000 # The total fixed budget available for all campaigns
+
+    # --- Scenario 1: Maximize Total Net Conversion Count ---
+    print("--- Optimizing to Maximize Total Net Conversion Count ---")
+    # Formulate the problem for conversion maximization
+    problem_conversion, x_vars_conversion = formulate_ad_campaign_optimization(
+        campaign_attributes, total_campaign_budget, objective_type="conversion"
+    )
+    # Solve the problem. PuLP will use a default solver (e.g., CBC, GLPK if installed).
+    problem_conversion.solve()
+
+    print(f"Optimization Status: {LpStatus[problem_conversion.status]}")
+    if problem_conversion.status == LpStatusOptimal:
+        print(f"Maximum Total Net Conversions Achieved: {problem_conversion.objective.value():.2f}")
+        print("Budget Allocation per Campaign:")
+        for campaign_name in campaign_attributes.keys():
+            allocated_budget = x_vars_conversion[campaign_name].value()
+            print(f"  {campaign_name}: ${allocated_budget:.2f}")
+
+            # Calculate and print derived metrics for verification
+            impressions = (allocated_budget / campaign_attributes[campaign_name]['CPM (dollar)']) * 1000
+            potential_reach_from_impressions = impressions / campaign_attributes[campaign_name]['Optimal Frequency']
+            actual_reached_users = min(campaign_attributes[campaign_name], potential_reach_from_impressions)
+            projected_conversions = actual_reached_users * campaign_attributes[campaign_name]['Net Conversion (%)']
+            projected_revenue = projected_conversions * campaign_attributes[campaign_name]
+            print(f"    (Impressions: {impressions:.0f}, Reached Users: {actual_reached_users:.0f}, Projected Conversions: {projected_conversions:.2f}, Projected Revenue: ${projected_revenue:.2f})")
+    print("\n" + "="*80 + "\n")
+
+    # --- Scenario 2: Maximize Total Projected Revenue ---
+    print("--- Optimizing to Maximize Total Projected Revenue ---")
+    # Formulate the problem for revenue maximization
+    problem_revenue, x_vars_revenue = formulate_ad_campaign_optimization(
+        campaign_attributes, total_campaign_budget, objective_type="revenue"
+    )
+    # Solve the problem
+    problem_revenue.solve()
+
+    print(f"Optimization Status: {LpStatus[problem_revenue.status]}")
+    if problem_revenue.status == LpStatusOptimal:
+        print(f"Maximum Total Projected Revenue Achieved: ${problem_revenue.objective.value():.2f}")
+        print("Budget Allocation per Campaign:")
+        for campaign_name in campaign_attributes.keys():
+            allocated_budget = x_vars_revenue[campaign_name].value()
+            print(f"  {campaign_name}: ${allocated_budget:.2f}")
+
+            # Calculate and print derived metrics for verification
+            impressions = (allocated_budget / campaign_attributes[campaign_name]['CPM (dollar)']) * 1000
+            potential_reach_from_impressions = impressions / campaign_attributes[campaign_name]['Optimal Frequency']
+            actual_reached_users = min(campaign_attributes[campaign_name], potential_reach_from_impressions)
+            projected_conversions = actual_reached_users * campaign_attributes[campaign_name]['Net Conversion (%)']
+            projected_revenue = projected_conversions * campaign_attributes[campaign_name]
+            print(f"    (Impressions: {impressions:.0f}, Reached Users: {actual_reached_users:.0f}, Projected Conversions: {projected_conversions:.2f}, Projected Revenue: ${projected_revenue:.2f})")
+    print("\n" + "="*80 + "\n")
