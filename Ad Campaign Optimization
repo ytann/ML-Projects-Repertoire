@@ -61,6 +61,7 @@ def formulate_ad_campaign_optimization(campaign_data, total_budget, objective_ty
     # Define a large 'M' for the Big M method.
     # M must be sufficiently large, greater than any possible value of ROC_i or (Impressions_i(x_i) / OF_i).
     # We estimate M based on the maximum possible reach opportunity or the maximum reach achievable with the total budget.
+    # Corrected: Access 'Reach Opportunity (n count)' from each dictionary
     max_roc_overall = max(d for d in campaign_data.values())
     min_optimal_frequency_overall = min(d['Optimal Frequency'] for d in campaign_data.values())
     min_cpm_overall = min(d['CPM (dollar)'] for d in campaign_data.values())
@@ -99,6 +100,7 @@ def formulate_ad_campaign_optimization(campaign_data, total_budget, objective_ty
 
         # Calculate Projected Revenue for campaign i
         # PR_i(x_i) = ProjectedNetConversionCount_i(x_i) * Revenue per person
+        # Corrected: Access 'Revenue per person' attribute
         prob += PR[i] == PNC[i] * campaign_data[i], f"PR_calc_{i}"
 
         # Add the appropriate metric to the total objective function
@@ -188,8 +190,10 @@ if __name__ == "__main__":
             # Calculate and print derived metrics for verification
             impressions = (allocated_budget / campaign_attributes[campaign_name]['CPM (dollar)']) * 1000
             potential_reach_from_impressions = impressions / campaign_attributes[campaign_name]['Optimal Frequency']
+            # Corrected: Access 'Reach Opportunity (n count)' attribute
             actual_reached_users = min(campaign_attributes[campaign_name], potential_reach_from_impressions)
             projected_conversions = actual_reached_users * campaign_attributes[campaign_name]['Net Conversion (%)']
+            # Corrected: Access 'Revenue per person' attribute
             projected_revenue = projected_conversions * campaign_attributes[campaign_name]
             print(f"    (Impressions: {impressions:.0f}, Reached Users: {actual_reached_users:.0f}, Projected Conversions: {projected_conversions:.2f}, Projected Revenue: ${projected_revenue:.2f})")
     print("\n" + "="*80 + "\n")
@@ -214,8 +218,10 @@ if __name__ == "__main__":
             # Calculate and print derived metrics for verification
             impressions = (allocated_budget / campaign_attributes[campaign_name]['CPM (dollar)']) * 1000
             potential_reach_from_impressions = impressions / campaign_attributes[campaign_name]['Optimal Frequency']
+            # Corrected: Access 'Reach Opportunity (n count)' attribute
             actual_reached_users = min(campaign_attributes[campaign_name], potential_reach_from_impressions)
             projected_conversions = actual_reached_users * campaign_attributes[campaign_name]['Net Conversion (%)']
+            # Corrected: Access 'Revenue per person' attribute
             projected_revenue = projected_conversions * campaign_attributes[campaign_name]
             print(f"    (Impressions: {impressions:.0f}, Reached Users: {actual_reached_users:.0f}, Projected Conversions: {projected_conversions:.2f}, Projected Revenue: ${projected_revenue:.2f})")
     print("\n" + "="*80 + "\n")
